@@ -1,0 +1,41 @@
+# Packaging added on the tbd-syntax branch so the pruning / decompilation scripts can be installed as an
+# editable dependency (`uv add --editable third_party/decompiling_transformers`). The upstream layout is a flat
+# script directory whose files import each other by bare name (`from patching_data import *`), so the whole
+# directory goes on sys.path as top-level modules; nothing else about the layout changes.
+#
+# Only what the pruning stages (patching.py and its imports) need is declared. The plotting and streamlit
+# scripts additionally want matplotlib, tyro, pandas, seaborn, plotly, scikit-learn and streamlit (extra `viz`).
+
+[project]
+name = "decompiling-transformers"
+version = "0.1.0"
+description = "Discovering Interpretable Algorithms by Decompiling Transformers to RASP (Huang et al., ICML 2026)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "numpy",
+    "pyyaml",
+    "click",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib", "tyro", "pandas", "seaborn", "plotly", "scikit-learn", "streamlit", "tqdm"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "crasp/scripts/patching"}
+py-modules = [
+    "attention_primitives_hook", "convert_mlp", "convert_to_code", "delineate_curve_for_model",
+    "find_primitives", "find_primitives_for_all_runs", "get_programs_and_heatmaps", "logits_primitives_hook",
+    "patching", "patching_data", "patching_helper_functions", "patching_utils", "plot_example_for_main_paper",
+    "plot_for_mlp_interpretation", "plot_for_mlp_main_paper_d4", "plot_for_mlp_main_paper_sort",
+    "plot_func_for_main_paper", "primitives_classes", "primitives_for_coefficients", "primitives_helpers",
+    "primitives_search", "print_all_primitives", "pruning_model", "round_primitive", "run_convert_mlp",
+    "run_pretty_example", "show_heatmap", "train_new_models", "train_new_models_archs",
+    "train_new_models_checkpoints", "train_new_models_search", "try_primitives",
+]
+packages = ["streamlit_app"]

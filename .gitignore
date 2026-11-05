@@ -4,3 +4,4 @@ __pycache__
 .vscode
 crasp/scripts/patching/streamlit_app/my_paths*.py
 patching_runs
+*.egg-info/

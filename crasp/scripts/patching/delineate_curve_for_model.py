@@ -1,4 +1,10 @@
-from streamlit_app.my_paths import SUBMIT_HOST, CONDA_PATH, CONDA_ENV, REMOTE_SCRIPT_PATH, output_dir, HISTORY_FILE, RUNNING_EXPERIMENTS_FILE, path_to_saved_model, CACHE_DIR, USER_NAME, SUBMIT_REQUIREMENTS, UNIVERSE
+try:
+    from streamlit_app.my_paths import SUBMIT_HOST, CONDA_PATH, CONDA_ENV, REMOTE_SCRIPT_PATH, output_dir, HISTORY_FILE, RUNNING_EXPERIMENTS_FILE, path_to_saved_model, CACHE_DIR, USER_NAME, SUBMIT_REQUIREMENTS, UNIVERSE
+except ImportError:  # no my_paths.py (tbd-syntax imports only the search helpers below; the HTCondor driver needs the real file)
+    import os as _os
+    SUBMIT_HOST = CONDA_PATH = CONDA_ENV = REMOTE_SCRIPT_PATH = HISTORY_FILE = RUNNING_EXPERIMENTS_FILE = CACHE_DIR = USER_NAME = SUBMIT_REQUIREMENTS = UNIVERSE = None
+    output_dir = _os.environ.get("DECOMPILE_OUTPUT_DIR", "patching_runs")
+    path_to_saved_model = _os.environ.get("DECOMPILE_SAVED_MODELS", "share/saved_models")
 import json
 import os
 import yaml
@@ -10,14 +16,17 @@ import re
 import random
 import string
 import time
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:  # only the (unused here) plotting path needs it
+    plt = None
 import numpy as np
 from copy import deepcopy
 import sys
 import math
 import click
 from transformers import GPT2LMHeadModel
-from patching_data import get_tokenizer_and_dataset_for_task
+from patching_data import get_tokenizer_and_dataset_for_task, resolve_tokenizer_and_dataset
 from pruning_model import PruningModelWithHooksForQK
 from train_new_models import customCollator, customBCECollator
 from collections import defaultdict
@@ -81,8 +90,7 @@ def get_baseline_loss_acc(config):
     device = torch.device("cuda") if config["device"] == "cuda" and torch.cuda.is_available() else torch.device("cpu")
     set_seed(config["seed"])
 
-    task_name = config["model_name"].split("-")[0]
-    tokenizer, dataset = get_tokenizer_and_dataset_for_task(task_name, config["length_range"], config["max_test_length"], {"period_for_data":config["period_for_data"]})
+    tokenizer, dataset = resolve_tokenizer_and_dataset(config)   # config["dataset_factory"] if set, else the built-in task
     use_BCE = getattr(dataset, "BCE", False)
 
     if not use_BCE:

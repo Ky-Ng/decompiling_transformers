@@ -620,6 +620,26 @@ def get_tokenizer_and_dataset_for_task(task, train_length_range, max_test_length
     return tokenizer, train_dataset
 
 
+def resolve_callable(spec):
+    """``"package.module:function"`` -> the function (tbd-syntax hook plumbing)."""
+    import importlib
+    module_name, _, func_name = spec.partition(":")
+    return getattr(importlib.import_module(module_name), func_name)
+
+
+def resolve_tokenizer_and_dataset(config):
+    """(tokenizer, iterable dataset) for a pruning config: ``config["dataset_factory"]`` if set, else the built-in task.
+
+    The factory is ``"module:function"`` and receives the whole config dict; it must return a tokenizer exposing
+    ``pad_token_id``, ``eos_token_id``, ``sep_token_id``, ``bos_token_id``, ``vocab`` and ``__len__`` and an
+    IterableDataset yielding ``(input_ids, position_ids, labels)`` lists (``-100`` or pad = unscored label).
+    """
+    if config.get("dataset_factory"):
+        return resolve_callable(config["dataset_factory"])(config)
+    task_name = config["model_name"].split("-")[0]
+    return get_tokenizer_and_dataset_for_task(task_name, config["length_range"], config["max_test_length"], config)
+
+
 class DFA():
     def __init__(self, sigma, Q, delta, q0, F):
         self.sigma = sigma

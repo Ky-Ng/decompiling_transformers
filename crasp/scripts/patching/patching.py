@@ -1,6 +1,5 @@
 from torch.utils.data import Dataset, DataLoader
 from functools import partial
-from matplotlib import pyplot as plt
 from transformers import GPT2LMHeadModel
 import yaml
 import click
@@ -12,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from copy import deepcopy
 from patching_utils import get_logging_function, set_seed, restore_int_keys
-from patching_data import EvalDataset, get_tokenizer_and_dataset_for_task
+from patching_data import EvalDataset, get_tokenizer_and_dataset_for_task, resolve_tokenizer_and_dataset, resolve_callable
 from train_new_models import customCollator, customBCECollator
 from collections import defaultdict
 from pruning_model import MaskSampler, OptimalAblationVectors, PruningModelWithHooks, MaskSamplerFullPaths, PruningModelWithHooksFullPaths, \
@@ -25,6 +24,20 @@ from patching_helper_functions import get_full_possible_config_for_pruning
 def run(config_path):
     with open(config_path, 'r') as file:
         config_dict = yaml.safe_load(file)
+    run_from_dict(config_dict)
+
+
+def run_from_dict(config_dict):
+    """One pruning run from a config dict (the body of ``run``; tbd-syntax calls this in-process).
+
+    Optional tbd-syntax keys, all additive (absent = the original behaviour):
+      dataset_factory      "module:function" -> (tokenizer, iterable_dataset); replaces the built-in tasks
+      extra_eval_factory   "module:function" -> {name: Dataset}; each is scored with the final binary masks
+                           and written to output_dict["extra_eval"][name]
+      num_test_steps_for_pruning   batches in the final test loop (original: 200)
+      attn_implementation  passed to from_pretrained (e.g. "eager")
+      log_callback         "module:function" -> f(dict) called with every logged metrics dict (e.g. wandb)
+    """
     torch.set_printoptions(sci_mode=False, precision=5)
     device = torch.device("cuda") if config_dict["device"] == "cuda" and torch.cuda.is_available() else torch.device("cpu")
     set_seed(config_dict["seed"])
@@ -39,14 +52,15 @@ def run(config_path):
     logger = get_logging_function(output_dir)
 
     logger(config_dict)
-    model = GPT2LMHeadModel.from_pretrained(Path(config_dict["path_to_saved_model"]) / config_dict["model_name"]).to(device)
+    load_kwargs = {"attn_implementation": config_dict["attn_implementation"]} if "attn_implementation" in config_dict else {}
+    model = GPT2LMHeadModel.from_pretrained(Path(config_dict["path_to_saved_model"]) / config_dict["model_name"], **load_kwargs).to(device)
     model.eval()
 
-    orig_model = GPT2LMHeadModel.from_pretrained(Path(config_dict["path_to_saved_model"]) / config_dict["model_name"]).to(device)
+    orig_model = GPT2LMHeadModel.from_pretrained(Path(config_dict["path_to_saved_model"]) / config_dict["model_name"], **load_kwargs).to(device)
     orig_model.eval()
 
-    task_name = config_dict["model_name"].split("-")[0]
-    tokenizer, iterable_dataset = get_tokenizer_and_dataset_for_task(task_name, config_dict["length_range"], config_dict["max_test_length"], config_dict)
+    tokenizer, iterable_dataset = resolve_tokenizer_and_dataset(config_dict)
+    log_callback = resolve_callable(config_dict["log_callback"]) if config_dict.get("log_callback") else (lambda d: None)
 
     logger(tokenizer.vocab)
     if hasattr(iterable_dataset, "BCE"):
@@ -334,6 +348,7 @@ def run(config_path):
 
             if (current_step+1) % log_interval == 0:
                 logger( {k: sum(v)/len(v) for k, v in training_logs.items()} )
+                log_callback({"stage": global_removal_iteration, "step": current_step + 1, **{k: sum(v)/len(v) for k, v in training_logs.items()}})
                 all_sample_p = torch.cat([p.data.detach().view(-1) for p in mask_sampler.parameters()], dim=0)
                 hist, bin_edges = torch.histogram(all_sample_p.cpu(), bins=5)
                 logger("histgram of sampling param", "\nhist", hist, "\nbin edges", bin_edges)
@@ -364,7 +379,7 @@ def run(config_path):
         logger(f"finish training ({current_step+1} steps)")
         
         # testing
-        num_test_step = 200
+        num_test_step = config_dict.get("num_test_steps_for_pruning", 200)
         num_correct = 0
         num_match = 0
         task_loss = 0
@@ -422,6 +437,11 @@ def run(config_path):
 
         logger(f"\nfinish testing ({num_test_step * batch_size} samples), Acc match: {acc_match:.3f}  Acc task: {acc_task:.3f} \t Task loss: {task_loss:.4f}  KL div: {kl_div:.6f}")
 
+        if config_dict.get("extra_eval_factory") and not use_BCE:
+            output_dict.setdefault("extra_eval", {})[str(global_removal_iteration)] = extra_evaluation(
+                resolve_callable(config_dict["extra_eval_factory"])(config_dict), orig_model, hooked_model, mask_sampler, oa_vecs,
+                collator, device, batch_size, logger)
+
         masks = mask_sampler.sample_binary_masks(1).squeeze(0)
         num_edges = (masks == 1).sum().item()
         if global_removal_iteration <= 1:
@@ -451,6 +471,33 @@ def run(config_path):
         json.dump(output_dict, f, indent=4)
 
     logger.cleanup()
+
+
+@torch.no_grad()
+def extra_evaluation(datasets, orig_model, hooked_model, mask_sampler, oa_vecs, collator, device, batch_size, logger):
+    """Match / task accuracy of the pruned model on fixed datasets (tbd-syntax: the frozen per-cell files).
+
+    datasets: {name: torch Dataset of (input_ids, pos_ids, labels)}. Returns {name: {"acc_match", "acc_task", "n"}}.
+    Match = same argmax as the original model at every position whose label is not -100, as in the test loop.
+    """
+    results = {}
+    for name, dataset in datasets.items():
+        num_match = num_correct = n = 0
+        for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch.pop("labels")
+            target_logits = orig_model(**batch).logits
+            masks = mask_sampler.sample_binary_masks(labels.size(0))
+            logits = hooked_model(masks=masks, oa_vecs=oa_vecs, **batch).logits
+            shift_labels = labels[:, 1:]
+            target_predictions = target_logits[:, :-1].argmax(dim=-1)
+            predictions = logits[:, :-1].argmax(dim=-1)
+            num_match += ((predictions == target_predictions) | (shift_labels == -100)).all(dim=1).sum().item()
+            num_correct += ((predictions == shift_labels) | (shift_labels == -100)).all(dim=1).sum().item()
+            n += labels.size(0)
+        results[name] = {"acc_match": num_match / n, "acc_task": num_correct / n, "n": n}
+        logger(f"extra eval {name}: acc_match {num_match / n:.3f}  acc_task {num_correct / n:.3f}  (n={n})")
+    return results
 
 
 if __name__ == '__main__':
